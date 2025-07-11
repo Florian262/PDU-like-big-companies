@@ -1,69 +1,74 @@
 import asyncio
+import yaml
 from fastapi import FastAPI, Response
 from datetime import datetime
 from prometheus_client import Gauge, Counter, CollectorRegistry, CONTENT_TYPE_LATEST, generate_latest
-from pysnmp.hlapi.asyncio import getCmd, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity
-import ipaddress
+from pysnmp.hlapi.asyncio import nextCmd, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity
 
-# Configuration
+# Load configuration from YAML
+with open("config.yaml") as f:
+    config = yaml.safe_load(f)
+
+PDU_IP = config['pdu']['ip']
+VOLTAGE_OID = config['pdu']['voltage_oid']
+ENERGY_OID = config['pdu']['energy_oid']
+SERVERS = config['pdu']['servers']
 COMMUNITY = 'public'
-IP_RANGE = '10.150.0.0/22'
-OID_MAP = {
-    'voltage': '1.3.6.1.4.1.42578.1.2.2.0',
-    'current1': '1.3.6.1.4.1.42578.1.3.2.3.0',
-    'current2': '1.3.6.1.4.1.42578.1.3.4.3.0',
-    'current3': '1.3.6.1.4.1.42578.1.3.6.3.0',
-    'current4': '1.3.6.1.4.1.42578.1.3.8.3.0',
-    'energy': '1.3.6.1.4.1.42578.1.2.5.0'
-}
 
 # Prometheus registry and metrics
 registry = CollectorRegistry()
-VOLTAGE_GAUGE = Gauge('pdu_voltage', 'Voltage reading', ['ip'], registry=registry)
-CURRENT_GAUGE = Gauge('pdu_current', 'Current reading', ['ip', 'port'], registry=registry)
-ENERGY_COUNTER = Counter('pdu_energy', 'Energy reading (Wh)', ['ip'], registry=registry)
+VOLTAGE_GAUGE = Gauge('pdu_voltage', 'Voltage reading', ['ip', 'oid'], registry=registry)
+CURRENT_GAUGE = Gauge('pdu_current', 'Current reading', ['ip', 'server', 'oid'], registry=registry)
+ENERGY_COUNTER = Counter('pdu_energy', 'Energy reading (Wh)', ['ip', 'oid'], registry=registry)
 SNMP_FAILURES = Counter('snmp_failures', 'SNMP failures', ['ip', 'oid'], registry=registry)
 
-# Async SNMP get
-async def snmp_get(ip, oid):
+# Async SNMP walk
+async def snmp_walk(ip, base_oid):
+    results = []
     try:
-        errorIndication, errorStatus, errorIndex, varBinds = await getCmd(
+        async for (errorIndication, errorStatus, errorIndex, varBinds) in nextCmd(
             CommunityData(COMMUNITY),
             UdpTransportTarget((ip, 161), timeout=1, retries=1),
             ContextData(),
-            ObjectType(ObjectIdentity(oid))
-        )
-        if errorIndication or errorStatus:
-            SNMP_FAILURES.labels(ip=ip, oid=oid).inc()
-            return None
-        for varBind in varBinds:
-            return float(str(varBind[1]))
+            ObjectType(ObjectIdentity(base_oid)),
+            lexicographicMode=False
+        ):
+            if errorIndication or errorStatus:
+                for varBind in varBinds:
+                    oid, _ = varBind
+                    SNMP_FAILURES.labels(ip=ip, oid=str(oid)).inc()
+                break
+            for varBind in varBinds:
+                oid, val = varBind
+                results.append((str(oid), float(str(val))))
     except Exception:
-        SNMP_FAILURES.labels(ip=ip, oid=oid).inc()
-        return None
+        SNMP_FAILURES.labels(ip=ip, oid=base_oid).inc()
+    return results
 
-# Poll all metrics for one device
-async def poll_device(ip):
-    voltage = await snmp_get(ip, OID_MAP['voltage'])
-    if voltage:
-        VOLTAGE_GAUGE.labels(ip=ip).set(voltage)
+# Poll all metrics using SNMP walk
+async def poll_device():
+    # Walk voltage
+    voltage_results = await snmp_walk(PDU_IP, VOLTAGE_OID)
+    for oid, val in voltage_results:
+        VOLTAGE_GAUGE.labels(ip=PDU_IP, oid=oid).set(val)
 
-    energy = await snmp_get(ip, OID_MAP['energy'])
-    if energy:
-        ENERGY_COUNTER.labels(ip=ip).inc(energy * 10)  # Convert kWh to Wh
+    # Walk energy
+    energy_results = await snmp_walk(PDU_IP, ENERGY_OID)
+    for oid, val in energy_results:
+        ENERGY_COUNTER.labels(ip=PDU_IP, oid=oid).inc(val * 10)  # kWh to Wh
 
-    for i in range(1, 5):
-        current_oid = OID_MAP[f'current{i}']
-        current_val = await snmp_get(ip, current_oid)
-        if current_val:
-            CURRENT_GAUGE.labels(ip=ip, port=f'{i}').set(current_val * 0.001)  # mA to A
+    # Walk current for each server
+    for server in SERVERS:
+        name = server['name']
+        base_oid = server['current_oid']
+        current_results = await snmp_walk(PDU_IP, base_oid)
+        for oid, val in current_results:
+            CURRENT_GAUGE.labels(ip=PDU_IP, server=name, oid=oid).set(val * 0.001)  # mA to A
 
 # Periodic poll loop
 async def poll_loop():
     while True:
-        all_ips = [str(ip) for ip in ipaddress.ip_network(IP_RANGE)]
-        tasks = [poll_device(ip) for ip in all_ips]
-        await asyncio.gather(*tasks)
+        await poll_device()
         await asyncio.sleep(30)  # wait before next cycle
 
 # FastAPI app
